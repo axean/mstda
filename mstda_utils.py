@@ -1,5 +1,31 @@
 import numpy as np
 import json
+from functools import partial
+
+def make_gaussian_mixtures(energy_tuple, sigma = 1):
+    def _mixture(ms):
+        mz     = ms["mz"]
+        intens = ms["intens"]
+        gauss  = list()
+        for (peak, intens) in zip(mz, intens):
+            # When a lambda is created, it doesn't make a copy of the variables in the enclosing scope that it uses
+            lambda_gaussian = lambda x, peak, intens, sigma : intens * np.exp(-.5*np.power((x - peak)/sigma,2))
+            gauss.append(
+                partial(
+                    lambda_gaussian,
+                    peak   = peak,
+                    intens = intens,
+                    sigma  = sigma
+                )
+            )
+            
+        return lambda x : (mix := sum([ f(x) for f in gauss ]))/np.max(mix)
+    
+    mixtures = list()
+    for e in energy_tuple:
+        mixtures.append(_mixture(e))
+
+    return tuple(mixtures)
 
 def print_dict(d: dict):
     class SetEncoder(json.JSONEncoder):

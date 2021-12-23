@@ -1,0 +1,10 @@
+jupyterlab
+numpy
+scipy
+tqdm
+colour
+giotto-tda
+matplotlib
+rdkit-pypi
+pandas
+tensorflow

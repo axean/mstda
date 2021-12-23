@@ -11,8 +11,44 @@ from functools import partial
 import json
 import os.path
 import scipy
+from multiprocessing import Pool, cpu_count
+from functools import partial
 
-class Model:
+def return_frags(
+    idx : int,
+    nnq,
+    molecules,
+    get_frag_function,
+    energies,
+):
+    nn = nnq[idx]
+    nhood = dict()
+    for n in nn:
+        name = molecules[n]
+        nhood[name] = get_frag_function(name)
+
+    nhood_mols = list()
+    for name, frags in nhood.items():
+        mols = list()
+        for e in energies:
+            mz_from_query = e[idx][:,0]
+            # select fragments close to the query
+            select = [
+                np.isclose(mz_from_query, b = x, rtol = 5e-7).any()
+                for x in frags[:,0].astype(float)
+            ]
+            mols.append(frags[select,:])
+        mols = tuple(mols)
+        mols = np.concatenate(mols, axis = 0)
+        nhood_mols.append(mols)
+
+    nhood_mols = tuple(nhood_mols)
+    nhood_mols = np.concatenate(nhood_mols, axis = 0)
+    nhood_mols = np.unique(nhood_mols, axis = 0)
+    nhood_mols = nhood_mols[ nhood_mols[:,0].astype(float).argsort() ]
+    return nhood_mols
+
+class FeatureSpace:
     def __init__(
         self,
         json_file           : str   = None,
@@ -25,7 +61,7 @@ class Model:
         n_jobs              : int   = -1,
     ):
         if json_file == None:
-            return # Blank model
+            return
         
         assert type(json_file) is str, "json_file argument should be a path"
         assert os.path.exists(json_file), json_file + " missing?"
@@ -40,24 +76,49 @@ class Model:
         self.diagram_epsilon     = diagram_epsilon
         self.homology_dimensions = homology_dimensions
         self.normalized_entropy  = normalized_entropy
-        self.n_jobs              = n_jobs
+        self.n_jobs              = cpu_count() - 1 if n_jobs == -1 else n_jobs
         
         self.pipeline  = Pipeline([
             ('diagram', Persistence(
-                homology_dimensions = homology_dimensions,
-                n_jobs              = n_jobs
+                homology_dimensions = self.homology_dimensions,
+                n_jobs              = self.n_jobs
             )),
             ('filter', Filtering(
-                epsilon             = diagram_epsilon
+                epsilon             = self.diagram_epsilon
             )),
             ('entropy', PersistenceEntropy(
-                normalize           = normalized_entropy,
-                n_jobs              = n_jobs
+                normalize           = self.normalized_entropy,
+                n_jobs              = self.n_jobs
             )),
         ])
         (self.features, self.molecules) = self._compute_features(self.db)
         self.kdtree = scipy.spatial.KDTree(self.features)
+        
+        # save some space
+        for m in self.db:
+            for edx in range(self.energy_levels):
+                self.db[m].pop("energy"+str(edx))
     
+    # return the fragments of a training SMILES
+    def get_frags(
+        self,
+        SMILES
+    ):
+        return np.asarray(self.db[SMILES]["frag"])
+    
+    # return the feature vector of a training SMILES
+    # to get all feature vectors, use self.features
+    def get_feature_vector(
+        self,
+        SMILES : str
+    ):
+        try:
+            idx = self.molecules.index(SMILES)
+            return self.features[idx, :]
+        except ValueError as _:
+            return None
+    
+    # return the fragments of the K closest neighbours in feature space
     def query(
         self,
         mass_specs : dict,
@@ -74,41 +135,27 @@ class Model:
         point_clouds = self._make_point_clouds(mass_specs, raw = True)
         energies = split_energy_levels(point_clouds.values(),levels = self.energy_levels)
 
-        result = dict()
-        for idx, label in enumerate(point_clouds.keys()):
-            nn = nnq[idx]
-            nhood = dict()
-            for n in nn:
-                name = self.molecules[n]
-                nhood[name] = self._get_frags(name)
-            
-            nhood_mols = list()
-            for name, frags in nhood.items():
-                mols = list()
-                for e in energies:
-                    mz_from_query = e[idx][:,0]
-                    # select fragments close to the query
-                    select = [
-                        np.isclose(mz_from_query, b = x, atol = 5e-5).any()
-                        for x in frags[:,0].astype(float)
-                    ]
-                    mols.append(frags[select,:])
-                mols = tuple(mols)
-                mols = np.concatenate(mols, axis = 0)
-                nhood_mols.append(mols)
-                
-            nhood_mols = tuple(nhood_mols)
-            nhood_mols = np.concatenate(nhood_mols, axis = 0)
-            nhood_mols = np.unique(nhood_mols, axis = 0)
-            nhood_mols = nhood_mols[ nhood_mols[:,0].astype(float).argsort() ]
-            result[label] = nhood_mols
-            
-        return result
+        with Pool(self.n_jobs) as pool:
+            result = pool.map(
+                partial(
+                    return_frags,
+                    nnq               = nnq,
+                    molecules         = self.molecules,
+                    get_frag_function = self.get_frags,
+                    energies          = energies,
+                ),
+                [ idx for idx in range(len(mass_specs)) ]
+            )
+        
+        return {
+            label : result[idx]
+            for idx,label in enumerate(point_clouds.keys())
+        }
                 
     def __str__(self) -> str:
         if hasattr(self, "features"):
             return "\n".join([
-                "Trained model:",
+                "Feature space:",
                 str("Molecules:\t\t\t")                 + str(len(self.molecules)),
                 str("Topological features:\t\t")        + str(self.features.shape),
                 str("Homology dimensions:\t\t")         + str(self.homology_dimensions),
@@ -116,43 +163,44 @@ class Model:
                 str("Mass transformed:\t\t"             + str(self.transform)),
                 str("Logarithmic integer mass:\t"       + str(self.log_x)),
                 str("Persistence diagram epsilon:\t"    + str(self.diagram_epsilon)),
-                str("Persistence entropy normalized:\t" + str(self.normalized_entropy))
+                str("Persistence entropy normalized:\t" + str(self.normalized_entropy)),
+                str("Parallelism (n_jobs):\t\t")        + str(self.n_jobs)
             ]).expandtabs()
         else:
-            return "Blank model"
+            return "Empty space"
         
     @classmethod
-    def load(cls, saved_model_path : str):
-        assert type(saved_model_path) is str, "saved_model_path should be a path"
-        assert os.path.exists(saved_model_path), saved_model_path + " missing?"
+    def load(cls, save_path : str):
+        assert type(save_path) is str, "save_path should be a path"
+        assert os.path.exists(save_path), save_path + " missing?"
         
-        model = Model()
-        with open(saved_model_path, mode = "r") as j:
+        fspace = FeatureSpace()
+        with open(save_path, mode = "r") as j:
             save_dict = json.load(j)
         
         for s,setting in save_dict["settings"].items():
-            setattr(model, s, setting)
+            setattr(fspace, s, setting)
         
-        setattr(model, "features", np.asarray(save_dict["features"]))
-        setattr(model, "molecules", save_dict["molecules"])
-        
-        model.pipeline = Pipeline([
+        fspace.features = np.asarray(save_dict["features"])
+        fspace.molecules = save_dict["molecules"]
+        fspace.pipeline = Pipeline([
             ('diagram', Persistence(
-                homology_dimensions = model.homology_dimensions,
-                n_jobs              = model.n_jobs
+                homology_dimensions = fspace.homology_dimensions,
+                n_jobs              = fspace.n_jobs
             )),
             ('filter', Filtering(
-                epsilon             = model.diagram_epsilon
+                epsilon             = fspace.diagram_epsilon
             )),
             ('entropy', PersistenceEntropy(
-                normalize           = model.normalized_entropy,
-                n_jobs              = model.n_jobs
+                normalize           = fspace.normalized_entropy,
+                n_jobs              = fspace.n_jobs
             )),
         ])
-        
-        return model
+        fspace.kdtree = scipy.spatial.KDTree(fspace.features)
+        fspace.db     = save_dict["db"]
+        return fspace
     
-    def save(self, save_model_path : str):
+    def save(self, save_path : str):
         save_dict = dict()
         save_dict["settings"] = dict()
         save_dict["settings"]["energy_levels"]       = self.energy_levels
@@ -165,17 +213,12 @@ class Model:
         
         save_dict["features"]  = [ list(f) for f in self.features ]
         save_dict["molecules"] = self.molecules
+        save_dict["db"]        = self.db
         
-        with open(save_model_path, mode = "w") as j:
+        with open(save_path, mode = "w") as j:
             json.dump(save_dict, j)
         
-        print("saved model to: " + os.path.abspath(save_model_path))
-    
-    def _get_frags(
-        self,
-        molecule
-    ):
-        return np.asarray(self.db[molecule]["frag"])
+        print("saved feature space to: " + os.path.abspath(save_path))
     
     def _make_point_clouds(
         self,
