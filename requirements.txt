@@ -8,3 +8,6 @@ matplotlib
 rdkit-pypi
 pandas
 tensorflow
+gudhi
+networkx
+more_itertools
