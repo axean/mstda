@@ -1,6 +1,13 @@
 from functools import partial
 import numpy as np
 
+
+def split_fpn(mass : float):
+    r = repr(mass)
+    i,d = tuple(r.split("."))
+    return (int(i),float("."+d))
+#
+
 def circumspheres(simplices, distance_matrix, X):
     assert all([ l == len(simplices[0]) for l in map(len,simplices) ])
     
